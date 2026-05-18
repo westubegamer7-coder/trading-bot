@@ -7,26 +7,32 @@ STARTING_BALANCE = 100.0
 LEVERAGE = 4
 TP_POINTS = 150
 SL_POINTS = 75
-CHECK_INTERVAL = 60  # Check every 60 seconds
 
 # Trading State
 balance = STARTING_BALANCE
 trades = []
 current_position = None
-price_history = []
 
-def get_btc_price():
+def get_15min_candles():
     try:
-        response = requests.get('https://api.kraken.com/0/public/Ticker?pair=XBTUSD')
+        response = requests.get(
+            'https://api.kraken.com/0/public/OHLC',
+            params={
+                'pair': 'XBTUSD',
+                'interval': 15
+            }
+        )
         data = response.json()
-        price = float(data['result']['XXBTZUSD']['c'][0])
-        return price
-    except:
-        print("Error fetching price")
+        candles = data['result']['XXBTZUSD']
+        closes = [float(c[4]) for c in candles]
+        return closes
+    except Exception as e:
+        print(f"Error fetching candles: {e}")
         return None
 
 def calculate_ema(prices, period=200):
     if len(prices) < period:
+        print(f"⏳ Building EMA... {len(prices)}/{period} candles")
         return None
     multiplier = 2 / (period + 1)
     ema = sum(prices[:period]) / period
@@ -34,33 +40,34 @@ def calculate_ema(prices, period=200):
         ema = (price - ema) * multiplier + ema
     return ema
 
-def detect_ut_bot_signal(prices, key_value=1, atr_period=10):
-    if len(prices) < atr_period + 2:
+def detect_signal(closes, key_value=1, atr_period=10):
+    if len(closes) < atr_period + 2:
         return None
     
     # Calculate ATR
-    atr = sum([abs(prices[i] - prices[i-1]) 
+    atr = sum([abs(closes[i] - closes[i-1]) 
                for i in range(-atr_period, 0)]) / atr_period
     
-    trailing_stop = prices[-2] - (key_value * atr)
+    nLoss = key_value * atr
     
-    prev_price = prices[-2]
-    curr_price = prices[-1]
+    prev_close = closes[-2]
+    curr_close = closes[-1]
+    prev_stop = closes[-3] - nLoss
     
     # Buy signal
-    if curr_price > trailing_stop and prev_price <= trailing_stop:
+    if curr_close > prev_stop and prev_close <= prev_stop:
         return 'buy'
-    # Sell signal
-    elif curr_price < trailing_stop and prev_price >= trailing_stop:
+    # Sell signal  
+    elif curr_close < prev_stop and prev_close >= prev_stop:
         return 'sell'
     
     return None
 
 def calculate_pnl(entry, exit_price, direction):
     if direction == 'buy':
-        return (exit_price - entry) / entry * (LEVERAGE * balance)
+        return (exit_price - entry) / entry * (LEVERAGE * STARTING_BALANCE)
     else:
-        return (entry - exit_price) / entry * (LEVERAGE * balance)
+        return (entry - exit_price) / entry * (LEVERAGE * STARTING_BALANCE)
 
 def check_position(current_price):
     global balance, current_position
@@ -75,15 +82,12 @@ def check_position(current_price):
     result = None
     exit_price = None
     
-    # Check TP
     if direction == 'buy' and current_price >= tp:
         result = 'TP'
         exit_price = tp
     elif direction == 'sell' and current_price <= tp:
         result = 'TP'
         exit_price = tp
-    
-    # Check SL
     elif direction == 'buy' and current_price <= sl:
         result = 'SL'
         exit_price = sl
@@ -106,14 +110,14 @@ def check_position(current_price):
             'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         })
         
+        wins = len([t for t in trades if t['pnl'] > 0])
+        
         print(f"\n{'='*40}")
         print(f"{'✅ WIN' if result == 'TP' else '❌ LOSS'} - {direction.upper()}")
         print(f"Entry: ${entry:,.1f} → Exit: ${exit_price:,.1f}")
         print(f"PnL: ${pnl:.2f}")
         print(f"Balance: ${balance:.2f}")
-        print(f"Total Trades: {len(trades)}")
-        wins = len([t for t in trades if t['pnl'] > 0])
-        print(f"Win Rate: {wins/len(trades)*100:.1f}%")
+        print(f"Trades: {len(trades)} | Wins: {wins} | Win Rate: {wins/len(trades)*100:.1f}%")
         print(f"{'='*40}")
         
         current_position = None
@@ -121,12 +125,11 @@ def check_position(current_price):
 def open_position(signal, price, ema):
     global current_position
     
-    # EMA Filter
     if signal == 'buy' and price < ema:
-        print(f"⚠️ Skipping BUY - price below 200 EMA")
+        print(f"⚠️ Skip BUY — price ${price:,.1f} below EMA ${ema:,.1f}")
         return
     if signal == 'sell' and price > ema:
-        print(f"⚠️ Skipping SELL - price above 200 EMA")
+        print(f"⚠️ Skip SELL — price ${price:,.1f} above EMA ${ema:,.1f}")
         return
     
     tp = price + TP_POINTS if signal == 'buy' else price - TP_POINTS
@@ -145,7 +148,7 @@ def open_position(signal, price, ema):
     print(f"Entry: ${price:,.1f}")
     print(f"TP: ${tp:,.1f} (+{TP_POINTS} pts)")
     print(f"SL: ${sl:,.1f} (-{SL_POINTS} pts)")
-    print(f"EMA: ${ema:,.1f}")
+    print(f"EMA 200: ${ema:,.1f}")
     print(f"Balance: ${balance:.2f}")
     print(f"{'='*40}")
 
@@ -155,63 +158,58 @@ def print_stats():
     total_pnl = sum(t['pnl'] for t in trades)
     win_rate = (wins / len(trades) * 100) if trades else 0
     
-    print(f"\n📊 STATS")
-    print(f"Balance: ${balance:.2f}")
-    print(f"Total PnL: ${total_pnl:.2f}")
-    print(f"Trades: {len(trades)} ({wins}W/{losses}L)")
-    print(f"Win Rate: {win_rate:.1f}%")
+    print(f"\n📊 STATS | Balance: ${balance:.2f} | PnL: ${total_pnl:.2f} | Trades: {len(trades)} ({wins}W/{losses}L) | Win Rate: {win_rate:.1f}%")
 
 def run_bot():
-    global price_history
-    
-    print("🤖 Trading Bot Started!")
-    print(f"💰 Balance: ${STARTING_BALANCE}")
-    print(f"📈 TP: {TP_POINTS} pts | SL: {SL_POINTS} pts")
-    print(f"⏱️ Checking every {CHECK_INTERVAL} seconds")
+    print("🤖 Bot Started!")
+    print(f"💰 Balance: ${STARTING_BALANCE} | Leverage: {LEVERAGE}x")
+    print(f"🎯 TP: {TP_POINTS} pts | SL: {SL_POINTS} pts")
+    print(f"📊 Timeframe: 15 min candles")
     print("="*40)
     
     last_signal = None
-    check_count = 0
+    last_candle_time = None
     
     while True:
         try:
-            price = get_btc_price()
-            if not price:
-                time.sleep(CHECK_INTERVAL)
+            closes = get_15min_candles()
+            if not closes:
+                time.sleep(60)
                 continue
             
-            price_history.append(price)
+            current_price = closes[-1]
+            ema = calculate_ema(closes)
             
-            # Keep last 300 prices
-            if len(price_history) > 300:
-                price_history = price_history[-300:]
+            now = datetime.now().strftime('%H:%M:%S')
             
-            ema = calculate_ema(price_history)
-            check_count += 1
-            
-            # Print status every 10 checks
-            if check_count % 10 == 0:
-                print(f"\n⏰ {datetime.now().strftime('%H:%M:%S')} | Price: ${price:,.1f} | EMA: ${ema:,.1f if ema else 'Building...'}")
-                if current_position:
-                    print(f"📍 Open {current_position['direction'].upper()} from ${current_position['entry']:,.1f}")
+            if ema:
+                trend = "📈 UPTREND" if current_price > ema else "📉 DOWNTREND"
+                print(f"\n⏰ {now} | Price: ${current_price:,.1f} | EMA: ${ema:,.1f} | {trend}")
+                
+                # Check existing position
+                check_position(current_price)
+                
+                # Look for new signal
+                if not current_position:
+                    signal = detect_signal(closes)
+                    
+                    if signal and signal != last_signal:
+                        print(f"🔔 Signal detected: {signal.upper()}")
+                        open_position(signal, current_price, ema)
+                        last_signal = signal
+                    else:
+                        print(f"👀 Watching... No new signal")
+                else:
+                    print(f"📍 Position open: {current_position['direction'].upper()} from ${current_position['entry']:,.1f} | TP: ${current_position['tp']:,.1f} | SL: ${current_position['sl']:,.1f}")
+                
                 print_stats()
             
-            # Check existing position
-            check_position(price)
-            
-            # Look for new signal only if no position open
-            if not current_position and ema:
-                signal = detect_ut_bot_signal(price_history)
-                
-                if signal and signal != last_signal:
-                    open_position(signal, price, ema)
-                    last_signal = signal
-            
-            time.sleep(CHECK_INTERVAL)
+            # Wait for next 15 min candle
+            time.sleep(900)
             
         except Exception as e:
-            print(f"Error: {e}")
-            time.sleep(CHECK_INTERVAL)
+            print(f"❌ Error: {e}")
+            time.sleep(60)
 
 if __name__ == '__main__':
     run_bot()
