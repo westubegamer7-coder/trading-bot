@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify
 from datetime import datetime
+import requests
 
 app = Flask(__name__)
 
@@ -15,6 +16,27 @@ balance = STARTING_BALANCE
 trades = []
 current_position = None
 price_history = []
+ema_ready = False
+
+def fetch_historical_candles():
+    """Fetch 200 historical 15min candles from Kraken on startup"""
+    try:
+        print("📥 Fetching 200 historical candles from Kraken...")
+        response = requests.get(
+            'https://api.kraken.com/0/public/OHLC',
+            params={
+                'pair': 'XBTUSD',
+                'interval': 15
+            }
+        )
+        data = response.json()
+        candles = data['result']['XXBTZUSD']
+        closes = [float(c[4]) for c in candles[-200:]]
+        print(f"✅ Loaded {len(closes)} historical candles!")
+        return closes
+    except Exception as e:
+        print(f"❌ Error fetching historical data: {e}")
+        return []
 
 def calculate_ema(prices, period=200):
     if len(prices) < period:
@@ -38,9 +60,19 @@ def print_stats():
     win_rate = (wins / len(trades) * 100) if trades else 0
     print(f"\n📊 STATS | Balance: ${balance:.2f} | PnL: ${total_pnl:.2f} | Trades: {len(trades)} ({wins}W/{losses}L) | Win Rate: {win_rate:.1f}%")
 
+# Load historical data on startup
+price_history = fetch_historical_candles()
+ema_ready = len(price_history) >= EMA_PERIOD
+
+if ema_ready:
+    current_ema = calculate_ema(price_history)
+    print(f"✅ EMA Ready! Current EMA: ${current_ema:,.1f}")
+else:
+    print(f"⚠️ Only {len(price_history)} candles loaded — need {EMA_PERIOD}")
+
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    global balance, current_position, price_history
+    global balance, current_position, price_history, ema_ready
 
     data = request.json
     signal = data.get('signal', '').lower()
@@ -60,6 +92,7 @@ def webhook():
         print(f"⏳ Building EMA... {len(price_history)}/{EMA_PERIOD} prices")
         return jsonify({'status': 'building EMA'})
 
+    ema_ready = True
     trend = "📈 UPTREND" if price > ema else "📉 DOWNTREND"
     print(f"💹 Price: ${price:,.1f} | EMA: ${ema:,.1f} | {trend}")
 
@@ -84,7 +117,7 @@ def webhook():
                 'balance': round(balance, 2),
                 'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             })
-            print(f"\n✅ WIN - {direction.upper()}")
+            print(f"\n✅ WIN - BUY TP HIT!")
             print(f"Entry: ${entry:,.1f} → Exit: ${tp:,.1f}")
             print(f"PnL: +${pnl:.2f} | Balance: ${balance:.2f}")
             print_stats()
@@ -103,13 +136,12 @@ def webhook():
                 'balance': round(balance, 2),
                 'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             })
-            print(f"\n✅ WIN - {direction.upper()}")
+            print(f"\n✅ WIN - SELL TP HIT!")
             print(f"Entry: ${entry:,.1f} → Exit: ${tp:,.1f}")
             print(f"PnL: +${pnl:.2f} | Balance: ${balance:.2f}")
             print_stats()
             current_position = None
 
-        # Check SL
         elif direction == 'buy' and price <= sl:
             pnl = calculate_pnl(entry, sl, direction)
             balance += pnl
@@ -123,7 +155,7 @@ def webhook():
                 'balance': round(balance, 2),
                 'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             })
-            print(f"\n❌ LOSS - {direction.upper()}")
+            print(f"\n❌ LOSS - BUY SL HIT!")
             print(f"Entry: ${entry:,.1f} → Exit: ${sl:,.1f}")
             print(f"PnL: ${pnl:.2f} | Balance: ${balance:.2f}")
             print_stats()
@@ -142,13 +174,12 @@ def webhook():
                 'balance': round(balance, 2),
                 'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             })
-            print(f"\n❌ LOSS - {direction.upper()}")
+            print(f"\n❌ LOSS - SELL SL HIT!")
             print(f"Entry: ${entry:,.1f} → Exit: ${sl:,.1f}")
             print(f"PnL: ${pnl:.2f} | Balance: ${balance:.2f}")
             print_stats()
             current_position = None
 
-        # Opposite signal closes position
         elif signal != current_position['direction']:
             pnl = calculate_pnl(entry, price, direction)
             balance += pnl
@@ -169,9 +200,8 @@ def webhook():
             print_stats()
             current_position = None
 
-    # Open new position if no current position
+    # Open new position
     if not current_position:
-        # EMA Filter
         if signal == 'buy' and price < ema:
             print(f"⚠️ Skip BUY — price below EMA")
             return jsonify({'status': 'skipped - below EMA'})
@@ -222,7 +252,7 @@ def stats():
 
 @app.route('/', methods=['GET'])
 def home():
-    return jsonify({'status': 'Bot is running!'})
+    return jsonify({'status': 'Bot is running!', 'ema_ready': ema_ready, 'balance': round(balance, 2)})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
